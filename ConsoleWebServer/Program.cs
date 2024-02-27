@@ -87,11 +87,16 @@ async void HandleNewClient(object? sender, Socket socket)
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"Failed to handle new client ({socket.RemoteEndPoint})! {ex}");
-    }
-    finally
-    {
-        socket.Close();
+        try
+        {
+            Console.WriteLine($"Failed to handle new client ({socket.RemoteEndPoint})! {ex}");
+            socket.Close();
+        }
+        catch (Exception ex2)
+        {
+            var aggregateEx = new AggregateException(ex, ex2);
+            Console.WriteLine($"Failed to handle new client and socket is unreadable! {aggregateEx}");
+        }
     }
 }
 
@@ -103,18 +108,20 @@ async Task<string> ReadData(Socket socket, Encoding encoding)
     return message.Trim();
 }
 
-Task TryHandleHttpRequest(string message, Socket socket)
+async Task TryHandleHttpRequest(string message, Socket socket)
 {
     if (message.Length == 0)
     {
-        return Task.CompletedTask;
+        socket.Close();
+        return;
     }
 
-    var lines = message.Split('\n');
+    var lines = message.Split("\r\n");
 
     if (lines.Length <= 0)
     {
-        return Task.CompletedTask;
+        socket.Close();
+        return;
     }
 
     var httpRequestLine = lines[0];
@@ -127,22 +134,21 @@ Task TryHandleHttpRequest(string message, Socket socket)
      */
     if (splitHttpRequestLine.Length < 3)
     {
-        return Task.CompletedTask;
+        return;
     }
 
-    var method = splitHttpRequestLine[0].Trim();
-    var resourceLocator = splitHttpRequestLine[1].Trim();
-    var httpVersion = splitHttpRequestLine[2].Trim();
+    var method = splitHttpRequestLine[0];
+    var resourceLocator = splitHttpRequestLine[1];
+    var httpVersion = splitHttpRequestLine[2];
 
     switch (method.ToUpperInvariant())
     {
         case Constants.HttpMethodGet:
-            return HandleHttpGetRequest(resourceLocator, httpVersion, splitHttpRequestLine, socket);
+            await HandleHttpGetRequest(resourceLocator, httpVersion, splitHttpRequestLine, socket);
+            break;
         default:
             break;
     }
-
-    return Task.CompletedTask;
 }
 
 async Task HandleHttpGetRequest(string resourceLocator, string httpVersion, string[] splitHttpRequestLine, Socket socket)
@@ -168,10 +174,11 @@ async Task HandleHttpGetRequest(string resourceLocator, string httpVersion, stri
 
         if (targetResource.Exists)
         {
-            httpResponse.Append(Constants.HttpResponseOk);
-            httpResponse.Append(Constants.HttpContentSeparator);
+            httpResponse.AppendLine(Constants.HttpResponseOk);
 
             var fileContent = await File.ReadAllTextAsync(targetResource.FullName, Encoding.UTF8);
+            httpResponse.AppendLine($"Content-Length: {fileContent.Length}");
+            httpResponse.AppendLine();
             httpResponse.Append(fileContent);
         }
         else
@@ -223,7 +230,4 @@ internal static class Constants
     public const string HttpResponseOk = "200 OK";
     public const string HttpResponseNotFound = "404 Not Found";
     public const string HttpResponseForbidden = "403 Forbidden";
-
-    public const string HttpHeaderSeparator = "\r\n";
-    public const string HttpContentSeparator = "\r\n\r\n";
 }
