@@ -171,7 +171,7 @@ async Task HandleHttpGetRequest(string resourceLocator, string httpVersion, stri
             httpResponse.Append(Constants.HttpResponseOk);
             httpResponse.Append(Constants.HttpContentSeparator);
 
-            var fileContent = await File.ReadAllLinesAsync(targetResource.FullName, Encoding.UTF8);
+            var fileContent = await File.ReadAllTextAsync(targetResource.FullName, Encoding.UTF8);
             httpResponse.Append(fileContent);
         }
         else
