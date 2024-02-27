@@ -83,7 +83,7 @@ async void HandleNewClient(object? sender, Socket socket)
         var message = await ReadData(socket, Encoding.UTF8);
         await TryHandleHttpRequest(message, socket);
 
-        Console.WriteLine($"Client {socket.RemoteEndPoint}: {message}");
+        Console.WriteLine($"Client {socket.RemoteEndPoint} -> Server: {message}");
     }
     catch (Exception ex)
     {
@@ -184,10 +184,9 @@ async Task HandleHttpGetRequest(string resourceLocator, string httpVersion, stri
         httpResponse.Append(Constants.HttpResponseForbidden);
     }
 
-    var encodedContent = Encoding.UTF8.GetBytes(httpResponse.ToString());
-
-    Console.WriteLine($"Server -> Client {socket.RemoteEndPoint}: {encodedContent}");
-
+    var httpResponseStr = httpResponse.ToString();
+    Console.WriteLine($"Server -> Client {socket.RemoteEndPoint}: {httpResponseStr}");
+    var encodedContent = Encoding.UTF8.GetBytes(httpResponseStr);
     _ = await socket.SendAsync(encodedContent);
 }
 
