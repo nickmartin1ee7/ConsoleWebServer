@@ -21,7 +21,7 @@ var permittedDirectoriesOption = new Option<string[]>(
     aliases: ["--dirs", "-d"],
     description: "The permitted directories that can be served to HTTP requests.");
 
-var rootCommand = new Command(name: "run", description: "Privative Console Web Server");
+var rootCommand = new Command(name: "run", description: "Primitive Console Web Server");
 
 rootCommand.AddOption(portOption);
 rootCommand.AddOption(permittedDirectoriesOption);
