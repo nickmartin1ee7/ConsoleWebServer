@@ -165,7 +165,7 @@ async Task<bool> TryHandleHttpRequest(string message, Socket socket, HashSet<Dir
 {
     if (message.Length == 0)
     {
-        socket.Close();
+        await SendResponse(socket, Constants.StatusBadRequest, "text/plain", "400 Bad Request - Empty request", false, cancellationToken);
         return false;
     }
 
@@ -173,7 +173,7 @@ async Task<bool> TryHandleHttpRequest(string message, Socket socket, HashSet<Dir
 
     if (lines.Length <= 0)
     {
-        socket.Close();
+        await SendResponse(socket, Constants.StatusBadRequest, "text/plain", "400 Bad Request - No request line", false, cancellationToken);
         return false;
     }
 
@@ -187,7 +187,7 @@ async Task<bool> TryHandleHttpRequest(string message, Socket socket, HashSet<Dir
      */
     if (splitHttpRequestLine.Length < 3)
     {
-        socket.Close();
+        await SendResponse(socket, Constants.StatusBadRequest, "text/plain", "400 Bad Request - Malformed request line", false, cancellationToken);
         return false;
     }
 
@@ -203,8 +203,7 @@ async Task<bool> TryHandleHttpRequest(string message, Socket socket, HashSet<Dir
             await HandleHttpGetRequest(resourceLocator, httpVersion, splitHttpRequestLine, socket, allowedResourceDirectories, keepAlive, cancellationToken);
             return keepAlive;
         default:
-            if (!keepAlive)
-                socket.Close();
+            await SendResponse(socket, Constants.StatusBadRequest, "text/plain", "400 Bad Request - Method not supported", keepAlive, cancellationToken);
             return keepAlive;
     }
 }
@@ -217,6 +216,17 @@ async Task HandleHttpGetRequest(string resourceLocator, string httpVersion, stri
         var pathOnly = queryIndex > -1
             ? resourceLocator[..queryIndex]
             : resourceLocator;
+
+        // Implement proper URI decoding (RFC compliance)
+        try
+        {
+            pathOnly = UrlDecode(pathOnly);
+        }
+        catch (Exception)
+        {
+            await SendResponse(socket, Constants.StatusBadRequest, "text/plain", "400 Bad Request - Invalid URI encoding", keepAlive, cancellationToken);
+            return;
+        }
 
         pathOnly = pathOnly.Replace("//", "/");
 
@@ -310,6 +320,11 @@ async Task SendResponse(Socket socket, string statusCode, string contentType, st
                  .Append(' ')
                  .Append(statusCode)
                  .Append(Constants.CRLF)
+                 .Append("Date: ")
+                 .Append(DateTime.UtcNow.ToString("R"))
+                 .Append(Constants.CRLF)
+                 .Append("Server: ConsoleWebServer/1.0")
+                 .Append(Constants.CRLF)
                  .Append("Content-Type: ")
                  .Append(contentType)
                  .Append(Constants.CRLF)
@@ -345,6 +360,11 @@ async Task SendFileResponse(Socket socket, FileInfo file, bool keepAlive, Cancel
     headerBuilder.Append(Constants.HttpVersion11)
                  .Append(' ')
                  .Append(Constants.StatusOk)
+                 .Append(Constants.CRLF)
+                 .Append("Date: ")
+                 .Append(DateTime.UtcNow.ToString("R"))
+                 .Append(Constants.CRLF)
+                 .Append("Server: ConsoleWebServer/1.0")
                  .Append(Constants.CRLF)
                  .Append("Content-Type: ")
                  .Append(contentType)
@@ -534,6 +554,39 @@ HashSet<DirectoryInfo> ScanAllowedResourceDirectories(IEnumerable<string> permit
     return hs;
 }
 
+string UrlDecode(string encodedPath)
+{
+    if (string.IsNullOrEmpty(encodedPath))
+        return encodedPath;
+
+    var result = new StringBuilder(encodedPath.Length);
+    for (int i = 0; i < encodedPath.Length; i++)
+    {
+        if (encodedPath[i] == '%' && i + 2 < encodedPath.Length)
+        {
+            var hexString = encodedPath.Substring(i + 1, 2);
+            if (int.TryParse(hexString, System.Globalization.NumberStyles.HexNumber, null, out int decodedChar))
+            {
+                result.Append((char)decodedChar);
+                i += 2; // Skip the next two characters
+            }
+            else
+            {
+                result.Append(encodedPath[i]);
+            }
+        }
+        else if (encodedPath[i] == '+')
+        {
+            result.Append(' ');
+        }
+        else
+        {
+            result.Append(encodedPath[i]);
+        }
+    }
+    return result.ToString();
+}
+
 internal static class Constants
 {
     // HTTP Methods (RFC 9110 Section 9)
@@ -541,8 +594,9 @@ internal static class Constants
 
     // HTTP Status Codes (RFC 9110 Section 15)
     public const string StatusOk = "200 OK";
-    public const string StatusNotFound = "404 Not Found";
+    public const string StatusBadRequest = "400 Bad Request";
     public const string StatusForbidden = "403 Forbidden";
+    public const string StatusNotFound = "404 Not Found";
 
     // HTTP Protocol (RFC 9112 Section 2.1)
     public const string HttpVersion11 = "HTTP/1.1";
