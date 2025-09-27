@@ -80,52 +80,89 @@ async Task HandleNewClient(Socket socket, HashSet<DirectoryInfo> allowedResource
     {
         Console.WriteLine($"New client connected: {socket.RemoteEndPoint}");
 
-        var message = await ReadData(socket, Encoding.UTF8);
-        await TryHandleHttpRequest(message, socket, allowedResourceDirectories);
-
-        Console.WriteLine($"Client {socket.RemoteEndPoint} -> Server: {message}");
+        // Handle multiple requests on the same connection (keep-alive support)
+        while (socket.Connected)
+        {
+            try
+            {
+                var message = await ReadData(socket, Encoding.UTF8);
+                
+                // If we get an empty message, client likely disconnected
+                if (string.IsNullOrEmpty(message))
+                {
+                    break;
+                }
+                
+                // Log only the request line, not the full content
+                var requestLine = message.Split("\r\n", StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+                Console.WriteLine($"Client {socket.RemoteEndPoint} -> Server: {requestLine}");
+                
+                var keepAlive = await TryHandleHttpRequest(message, socket, allowedResourceDirectories);
+                
+                // If keep-alive is false, close the connection
+                if (!keepAlive)
+                {
+                    break;
+                }
+            }
+            catch (SocketException)
+            {
+                // Client disconnected or network error
+                break;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error handling request from {socket.RemoteEndPoint}: {ex.Message}");
+                break;
+            }
+        }
     }
     catch (Exception ex)
     {
+        Console.WriteLine($"Failed to handle new client ({socket.RemoteEndPoint})! {ex.Message}");
+    }
+    finally
+    {
         try
         {
-            Console.WriteLine($"Failed to handle new client ({socket.RemoteEndPoint})! {ex}");
             socket.Close();
         }
-        catch (Exception ex2)
+        catch { /* Ignore close errors */ }
+        
+        // Remove client from dictionary when connection is finally closed
+        if (socket.RemoteEndPoint != null && clients.ContainsKey(socket.RemoteEndPoint))
         {
-            var aggregateEx = new AggregateException(ex, ex2);
-            Console.WriteLine($"Failed to handle new client and socket is unreadable! {aggregateEx}");
+            clients.Remove(socket.RemoteEndPoint);
         }
     }
 }
 
 async Task<string> ReadData(Socket socket, Encoding encoding)
 {
-    var buffer = new byte[1024];
-    _ = await socket.ReceiveAsync(buffer);
-    var message = encoding.GetString(buffer);
-    return message.Trim();
+    var buffer = new byte[4096];
+    var bytesReceived = await socket.ReceiveAsync(buffer);
+    var message = encoding.GetString(buffer, 0, bytesReceived);
+    return message.TrimEnd('\0', ' ', '\r', '\n');
 }
 
-async Task TryHandleHttpRequest(string message, Socket socket, HashSet<DirectoryInfo> allowedResourceDirectories)
+async Task<bool> TryHandleHttpRequest(string message, Socket socket, HashSet<DirectoryInfo> allowedResourceDirectories)
 {
     if (message.Length == 0)
     {
         socket.Close();
-        return;
+        return false;
     }
 
-    var lines = message.Split("\r\n");
+    var lines = message.Split("\r\n", StringSplitOptions.RemoveEmptyEntries);
 
     if (lines.Length <= 0)
     {
         socket.Close();
-        return;
+        return false;
     }
 
     var httpRequestLine = lines[0];
-    var splitHttpRequestLine = httpRequestLine.Split(' ');
+    var splitHttpRequestLine = httpRequestLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
     /*
      * [0] - HTTP Method (GET)
@@ -134,27 +171,31 @@ async Task TryHandleHttpRequest(string message, Socket socket, HashSet<Directory
      */
     if (splitHttpRequestLine.Length < 3)
     {
-        return;
+        socket.Close();
+        return false;
     }
 
     var method = splitHttpRequestLine[0];
     var resourceLocator = splitHttpRequestLine[1];
     var httpVersion = splitHttpRequestLine[2];
 
+    // Check for Connection: keep-alive header
+    var keepAlive = CheckKeepAlive(lines);
+
     switch (method.ToUpperInvariant())
     {
         case Constants.HttpMethodGet:
-            await HandleHttpGetRequest(resourceLocator, httpVersion, splitHttpRequestLine, socket, allowedResourceDirectories);
-            break;
+            await HandleHttpGetRequest(resourceLocator, httpVersion, splitHttpRequestLine, socket, allowedResourceDirectories, keepAlive);
+            return keepAlive;
         default:
-            break;
+            if (!keepAlive)
+                socket.Close();
+            return keepAlive;
     }
 }
 
-async Task HandleHttpGetRequest(string resourceLocator, string httpVersion, string[] splitHttpRequestLine, Socket socket, HashSet<DirectoryInfo> allowedResourceDirectories)
+async Task HandleHttpGetRequest(string resourceLocator, string httpVersion, string[] splitHttpRequestLine, Socket socket, HashSet<DirectoryInfo> allowedResourceDirectories, bool keepAlive)
 {
-    var httpResponse = new StringBuilder(httpVersion + " ");
-
     try
     {
         var queryIndex = resourceLocator.IndexOf('?');
@@ -162,8 +203,7 @@ async Task HandleHttpGetRequest(string resourceLocator, string httpVersion, stri
             ? resourceLocator[..queryIndex]
             : resourceLocator;
 
-        pathOnly = pathOnly
-            .Replace("//", "/");
+        pathOnly = pathOnly.Replace("//", "/");
 
         // Try to find the resource in the allowed directories
         DirectoryInfo? matchingDirectory = null;
@@ -197,26 +237,17 @@ async Task HandleHttpGetRequest(string resourceLocator, string httpVersion, stri
         {
             // Generate directory listing
             var directoryListing = GenerateDirectoryListing(matchingDirectory, pathOnly, allowedResourceDirectories);
-            
-            httpResponse.AppendLine(Constants.HttpResponseOk);
-            httpResponse.AppendLine("Content-Type: text/html");
-            httpResponse.AppendLine($"Content-Length: {directoryListing.Length}");
-            httpResponse.AppendLine();
-            httpResponse.Append(directoryListing);
+            await SendResponse(socket, Constants.HttpResponseOk, "text/html", directoryListing, keepAlive);
         }
         else if (matchingFile != null)
         {
-            // Serve the file
-            httpResponse.AppendLine(Constants.HttpResponseOk);
-
-            var fileContent = await File.ReadAllTextAsync(matchingFile.FullName, Encoding.UTF8);
-            httpResponse.AppendLine($"Content-Length: {fileContent.Length}");
-            httpResponse.AppendLine();
-            httpResponse.Append(fileContent);
+            // Serve the file - use streaming for better memory efficiency
+            await SendFileResponse(socket, matchingFile, keepAlive);
         }
         else
         {
             // Try to find index.html in directories if path ends with /
+            bool indexFound = false;
             if (pathOnly.EndsWith("/"))
             {
                 foreach (var allowedDir in allowedResourceDirectories)
@@ -225,31 +256,106 @@ async Task HandleHttpGetRequest(string resourceLocator, string httpVersion, stri
                     var indexFile = new FileInfo(indexPath);
                     if (indexFile.Exists)
                     {
-                        httpResponse.AppendLine(Constants.HttpResponseOk);
-                        var fileContent = await File.ReadAllTextAsync(indexFile.FullName, Encoding.UTF8);
-                        httpResponse.AppendLine($"Content-Length: {fileContent.Length}");
-                        httpResponse.AppendLine();
-                        httpResponse.Append(fileContent);
+                        await SendFileResponse(socket, indexFile, keepAlive);
+                        indexFound = true;
                         break;
                     }
                 }
             }
             
-            if (!httpResponse.ToString().Contains(Constants.HttpResponseOk))
+            if (!indexFound)
             {
-                httpResponse.Append(Constants.HttpResponseNotFound);
+                await SendResponse(socket, Constants.HttpResponseNotFound, "text/plain", "404 Not Found", keepAlive);
             }
         }
     }
     catch (SecurityException)
     {
-        httpResponse.Append(Constants.HttpResponseForbidden);
+        await SendResponse(socket, Constants.HttpResponseForbidden, "text/plain", "403 Forbidden", keepAlive);
     }
+    finally
+    {
+        // Connection management is now handled by the caller
+        // Don't close socket here as we may want to keep it alive
+    }
+}
 
-    var httpResponseStr = httpResponse.ToString();
-    Console.WriteLine($"Server -> Client {socket.RemoteEndPoint}: {httpResponseStr}");
-    var encodedContent = Encoding.UTF8.GetBytes(httpResponseStr);
-    _ = await socket.SendAsync(encodedContent);
+bool CheckKeepAlive(string[] headers)
+{
+    foreach (var header in headers)
+    {
+        if (header.StartsWith("Connection:", StringComparison.OrdinalIgnoreCase))
+        {
+            return header.Contains("keep-alive", StringComparison.OrdinalIgnoreCase);
+        }
+    }
+    return false; // Default to close connection if no keep-alive header
+}
+
+async Task SendResponse(Socket socket, string statusCode, string contentType, string content, bool keepAlive)
+{
+    var contentBytes = Encoding.UTF8.GetBytes(content);
+    var headers = $"HTTP/1.1 {statusCode}\r\n" +
+                 $"Content-Type: {contentType}\r\n" +
+                 $"Content-Length: {contentBytes.Length}\r\n" +
+                 $"Connection: {(keepAlive ? "keep-alive" : "close")}\r\n\r\n";
+    
+    var headerBytes = Encoding.UTF8.GetBytes(headers);
+    
+    // Log only headers, not content
+    Console.WriteLine($"Server -> Client {socket.RemoteEndPoint}: {headers.TrimEnd()}");
+    
+    // Send headers
+    await socket.SendAsync(headerBytes);
+    
+    // Send content
+    await socket.SendAsync(contentBytes);
+}
+
+async Task SendFileResponse(Socket socket, FileInfo file, bool keepAlive)
+{
+    var contentType = GetContentType(file.Extension);
+    var headers = $"HTTP/1.1 {Constants.HttpResponseOk}\r\n" +
+                 $"Content-Type: {contentType}\r\n" +
+                 $"Content-Length: {file.Length}\r\n" +
+                 $"Connection: {(keepAlive ? "keep-alive" : "close")}\r\n\r\n";
+    
+    var headerBytes = Encoding.UTF8.GetBytes(headers);
+    
+    // Log only headers, not content
+    Console.WriteLine($"Server -> Client {socket.RemoteEndPoint}: {headers.TrimEnd()}");
+    
+    // Send headers
+    await socket.SendAsync(headerBytes);
+    
+    // Stream file content in chunks to avoid loading entire file into memory
+    using var fileStream = file.OpenRead();
+    var buffer = new byte[8192];
+    int bytesRead;
+    while ((bytesRead = await fileStream.ReadAsync(buffer)) > 0)
+    {
+        await socket.SendAsync(buffer.AsMemory(0, bytesRead));
+    }
+}
+
+string GetContentType(string fileExtension)
+{
+    return fileExtension.ToLowerInvariant() switch
+    {
+        ".html" or ".htm" => "text/html",
+        ".css" => "text/css",
+        ".js" => "application/javascript",
+        ".json" => "application/json",
+        ".png" => "image/png",
+        ".jpg" or ".jpeg" => "image/jpeg",
+        ".gif" => "image/gif",
+        ".svg" => "image/svg+xml",
+        ".ico" => "image/x-icon",
+        ".txt" => "text/plain",
+        ".xml" => "application/xml",
+        ".pdf" => "application/pdf",
+        _ => "application/octet-stream"
+    };
 }
 
 string GenerateDirectoryListing(DirectoryInfo directory, string requestPath, HashSet<DirectoryInfo> allowedResourceDirectories)
