@@ -1,4 +1,5 @@
-﻿using System.CommandLine;
+﻿using System.Buffers;
+using System.CommandLine;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
@@ -78,37 +79,31 @@ async Task HandleNewClient(Socket socket, HashSet<DirectoryInfo> allowedResource
 {
     const int keepAliveTimeoutSeconds = 60;
     using var connectionCts = new CancellationTokenSource();
-    
+
     try
     {
         Console.WriteLine($"New client connected: {socket.RemoteEndPoint}");
 
-        // Handle multiple requests on the same connection (keep-alive support)
         while (socket.Connected)
         {
             try
             {
-                // Set timeout for keep-alive connections (60 seconds)
                 connectionCts.CancelAfter(TimeSpan.FromSeconds(keepAliveTimeoutSeconds));
-                
-                var message = await ReadData(socket, Encoding.UTF8, connectionCts.Token);
 
-                // If we get an empty message, client likely disconnected
+                var message = await ReadData(socket, Constants.Utf8Encoding, connectionCts.Token);
+
                 if (string.IsNullOrEmpty(message))
                 {
                     break;
                 }
 
-                // Reset the timeout for the next request after successful read
                 connectionCts.CancelAfter(Timeout.Infinite);
 
-                // Log only the request line, not the full content
-                var requestLine = message.Split("\r\n", StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+                var requestLine = message.Split(Constants.CRLFSeparator, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
                 Console.WriteLine($"Client {socket.RemoteEndPoint} -> Server: {requestLine}");
 
                 var keepAlive = await TryHandleHttpRequest(message, socket, allowedResourceDirectories, connectionCts.Token);
 
-                // If keep-alive is false, close the connection
                 if (!keepAlive)
                 {
                     break;
@@ -116,13 +111,11 @@ async Task HandleNewClient(Socket socket, HashSet<DirectoryInfo> allowedResource
             }
             catch (OperationCanceledException)
             {
-                // Timeout occurred - close the connection
                 Console.WriteLine($"Keep-alive timeout ({keepAliveTimeoutSeconds}s) reached for {socket.RemoteEndPoint}");
                 break;
             }
             catch (SocketException)
             {
-                // Client disconnected or network error
                 break;
             }
             catch (Exception ex)
@@ -142,9 +135,8 @@ async Task HandleNewClient(Socket socket, HashSet<DirectoryInfo> allowedResource
         {
             socket.Close();
         }
-        catch { /* Ignore close errors */ }
-        
-        // Remove client from dictionary when connection is finally closed
+        catch { }
+
         if (socket.RemoteEndPoint != null && clients.ContainsKey(socket.RemoteEndPoint))
         {
             clients.Remove(socket.RemoteEndPoint);
@@ -154,10 +146,19 @@ async Task HandleNewClient(Socket socket, HashSet<DirectoryInfo> allowedResource
 
 async Task<string> ReadData(Socket socket, Encoding encoding, CancellationToken cancellationToken = default)
 {
-    var buffer = new byte[4096];
-    var bytesReceived = await socket.ReceiveAsync(buffer, cancellationToken);
-    var message = encoding.GetString(buffer, 0, bytesReceived);
-    return message.TrimEnd('\0', ' ', '\r', '\n');
+    const int bufferSize = 4096;
+    var buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
+
+    try
+    {
+        var bytesReceived = await socket.ReceiveAsync(buffer.AsMemory(0, bufferSize), cancellationToken);
+        var message = encoding.GetString(buffer, 0, bytesReceived);
+        return message.TrimEnd(Constants.TrimChars);
+    }
+    finally
+    {
+        ArrayPool<byte>.Shared.Return(buffer);
+    }
 }
 
 async Task<bool> TryHandleHttpRequest(string message, Socket socket, HashSet<DirectoryInfo> allowedResourceDirectories, CancellationToken cancellationToken = default)
@@ -168,7 +169,7 @@ async Task<bool> TryHandleHttpRequest(string message, Socket socket, HashSet<Dir
         return false;
     }
 
-    var lines = message.Split("\r\n", StringSplitOptions.RemoveEmptyEntries);
+    var lines = message.Split(Constants.CRLFSeparator, StringSplitOptions.RemoveEmptyEntries);
 
     if (lines.Length <= 0)
     {
@@ -177,7 +178,7 @@ async Task<bool> TryHandleHttpRequest(string message, Socket socket, HashSet<Dir
     }
 
     var httpRequestLine = lines[0];
-    var splitHttpRequestLine = httpRequestLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+    var splitHttpRequestLine = httpRequestLine.Split(Constants.SpaceSeparator, StringSplitOptions.RemoveEmptyEntries);
 
     /*
      * [0] - HTTP Method (GET)
@@ -194,12 +195,11 @@ async Task<bool> TryHandleHttpRequest(string message, Socket socket, HashSet<Dir
     var resourceLocator = splitHttpRequestLine[1];
     var httpVersion = splitHttpRequestLine[2];
 
-    // Check for Connection: keep-alive header
     var keepAlive = CheckKeepAlive(lines);
 
     switch (method.ToUpperInvariant())
     {
-        case Constants.HttpMethodGet:
+        case Constants.MethodGet:
             await HandleHttpGetRequest(resourceLocator, httpVersion, splitHttpRequestLine, socket, allowedResourceDirectories, keepAlive, cancellationToken);
             return keepAlive;
         default:
@@ -220,14 +220,13 @@ async Task HandleHttpGetRequest(string resourceLocator, string httpVersion, stri
 
         pathOnly = pathOnly.Replace("//", "/");
 
-        // Try to find the resource in the allowed directories
         DirectoryInfo? matchingDirectory = null;
         FileInfo? matchingFile = null;
-        
+
         foreach (var allowedDir in allowedResourceDirectories)
         {
             var fullPath = Path.Combine(allowedDir.FullName, pathOnly.TrimStart('/'));
-            
+
             if (pathOnly.EndsWith("/"))
             {
                 var directory = new DirectoryInfo(fullPath);
@@ -250,18 +249,15 @@ async Task HandleHttpGetRequest(string resourceLocator, string httpVersion, stri
 
         if (matchingDirectory != null && pathOnly.EndsWith("/"))
         {
-            // Generate directory listing
             var directoryListing = GenerateDirectoryListing(matchingDirectory, pathOnly, allowedResourceDirectories);
-            await SendResponse(socket, Constants.HttpResponseOk, "text/html", directoryListing, keepAlive, cancellationToken);
+            await SendResponse(socket, Constants.StatusOk, "text/html", directoryListing, keepAlive, cancellationToken);
         }
         else if (matchingFile != null)
         {
-            // Serve the file - use streaming for better memory efficiency
             await SendFileResponse(socket, matchingFile, keepAlive, cancellationToken);
         }
         else
         {
-            // Try to find index.html in directories if path ends with /
             bool indexFound = false;
             if (pathOnly.EndsWith("/"))
             {
@@ -277,21 +273,19 @@ async Task HandleHttpGetRequest(string resourceLocator, string httpVersion, stri
                     }
                 }
             }
-            
+
             if (!indexFound)
             {
-                await SendResponse(socket, Constants.HttpResponseNotFound, "text/plain", "404 Not Found", keepAlive, cancellationToken);
+                await SendResponse(socket, Constants.StatusNotFound, "text/plain", "404 Not Found", keepAlive, cancellationToken);
             }
         }
     }
     catch (SecurityException)
     {
-        await SendResponse(socket, Constants.HttpResponseForbidden, "text/plain", "403 Forbidden", keepAlive, cancellationToken);
+        await SendResponse(socket, Constants.StatusForbidden, "text/plain", "403 Forbidden", keepAlive, cancellationToken);
     }
     finally
     {
-        // Connection management is now handled by the caller
-        // Don't close socket here as we may want to keep it alive
     }
 }
 
@@ -301,69 +295,96 @@ bool CheckKeepAlive(string[] headers)
     {
         if (header.StartsWith("Connection:", StringComparison.OrdinalIgnoreCase))
         {
-            return header.Contains("keep-alive", StringComparison.OrdinalIgnoreCase);
+            return header.Contains(Constants.ConnectionKeepAlive, StringComparison.OrdinalIgnoreCase);
         }
     }
-    return false; // Default to close connection if no keep-alive header
+    return false;
 }
 
 async Task SendResponse(Socket socket, string statusCode, string contentType, string content, bool keepAlive, CancellationToken cancellationToken = default)
 {
-    var contentBytes = Encoding.UTF8.GetBytes(content);
-    var headers = $"HTTP/1.1 {statusCode}\r\n" +
-                 $"Content-Type: {contentType}\r\n" +
-                 $"Content-Length: {contentBytes.Length}\r\n" +
-                 $"Connection: {(keepAlive ? "keep-alive" : "close")}\r\n";
-    
+    var contentBytes = Constants.Utf8Encoding.GetBytes(content);
+
+    var headerBuilder = new StringBuilder(256);
+    headerBuilder.Append(Constants.HttpVersion11)
+                 .Append(' ')
+                 .Append(statusCode)
+                 .Append(Constants.CRLF)
+                 .Append("Content-Type: ")
+                 .Append(contentType)
+                 .Append(Constants.CRLF)
+                 .Append("Content-Length: ")
+                 .Append(contentBytes.Length)
+                 .Append(Constants.CRLF)
+                 .Append("Connection: ")
+                 .Append(keepAlive ? Constants.ConnectionKeepAlive : Constants.ConnectionClose)
+                 .Append(Constants.CRLF);
+
     if (keepAlive)
     {
-        headers += $"Keep-Alive: timeout=60, max=100\r\n";
+        headerBuilder.Append("Keep-Alive: timeout=60, max=100")
+                     .Append(Constants.CRLF);
     }
-    
-    headers += "\r\n";
-    
-    var headerBytes = Encoding.UTF8.GetBytes(headers);
-    
-    // Log only headers, not content
+
+    headerBuilder.Append(Constants.CRLF);
+
+    var headers = headerBuilder.ToString();
+    var headerBytes = Constants.Utf8Encoding.GetBytes(headers);
+
     Console.WriteLine($"Server -> Client {socket.RemoteEndPoint}: {headers.TrimEnd()}");
-    
-    // Send headers
+
     await socket.SendAsync(headerBytes, cancellationToken);
-    
-    // Send content
     await socket.SendAsync(contentBytes, cancellationToken);
 }
 
 async Task SendFileResponse(Socket socket, FileInfo file, bool keepAlive, CancellationToken cancellationToken = default)
 {
     var contentType = GetContentType(file.Extension);
-    var headers = $"HTTP/1.1 {Constants.HttpResponseOk}\r\n" +
-                 $"Content-Type: {contentType}\r\n" +
-                 $"Content-Length: {file.Length}\r\n" +
-                 $"Connection: {(keepAlive ? "keep-alive" : "close")}\r\n";
-    
+
+    var headerBuilder = new StringBuilder(256);
+    headerBuilder.Append(Constants.HttpVersion11)
+                 .Append(' ')
+                 .Append(Constants.StatusOk)
+                 .Append(Constants.CRLF)
+                 .Append("Content-Type: ")
+                 .Append(contentType)
+                 .Append(Constants.CRLF)
+                 .Append("Content-Length: ")
+                 .Append(file.Length)
+                 .Append(Constants.CRLF)
+                 .Append("Connection: ")
+                 .Append(keepAlive ? Constants.ConnectionKeepAlive : Constants.ConnectionClose)
+                 .Append(Constants.CRLF);
+
     if (keepAlive)
     {
-        headers += $"Keep-Alive: timeout=60, max=100\r\n";
+        headerBuilder.Append("Keep-Alive: timeout=60, max=100")
+                     .Append(Constants.CRLF);
     }
-    
-    headers += "\r\n";
-    
-    var headerBytes = Encoding.UTF8.GetBytes(headers);
-    
-    // Log only headers, not content
+
+    headerBuilder.Append(Constants.CRLF);
+
+    var headers = headerBuilder.ToString();
+    var headerBytes = Constants.Utf8Encoding.GetBytes(headers);
+
     Console.WriteLine($"Server -> Client {socket.RemoteEndPoint}: {headers.TrimEnd()}");
-    
-    // Send headers
+
     await socket.SendAsync(headerBytes, cancellationToken);
-    
-    // Stream file content in chunks to avoid loading entire file into memory
     using var fileStream = file.OpenRead();
-    var buffer = new byte[8192];
-    int bytesRead;
-    while ((bytesRead = await fileStream.ReadAsync(buffer, cancellationToken)) > 0)
+    const int bufferSize = 8192;
+    var buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
+
+    try
     {
-        await socket.SendAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
+        int bytesRead;
+        while ((bytesRead = await fileStream.ReadAsync(buffer.AsMemory(0, bufferSize), cancellationToken)) > 0)
+        {
+            await socket.SendAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
+        }
+    }
+    finally
+    {
+        ArrayPool<byte>.Shared.Return(buffer);
     }
 }
 
@@ -399,8 +420,7 @@ string GenerateDirectoryListing(DirectoryInfo directory, string requestPath, Has
     html.AppendLine($"<h1>Index of {requestPath}</h1>");
     html.AppendLine("<hr>");
     html.AppendLine("<pre>");
-    
-    // Add parent directory link if not at root
+
     if (requestPath != "/" && CanNavigateToParent(directory, allowedResourceDirectories))
     {
         var parentPath = requestPath.TrimEnd('/');
@@ -408,41 +428,64 @@ string GenerateDirectoryListing(DirectoryInfo directory, string requestPath, Has
         var parentRequestPath = lastSlash <= 0 ? "/" : parentPath[..lastSlash] + "/";
         html.AppendLine($"<a href=\"{parentRequestPath}\">../</a>");
     }
-    
+
     try
     {
-        // List directories first
         var directories = directory.GetDirectories()
             .OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase);
-        
+
+        var pathBuilder = new StringBuilder(requestPath.Length + 64);
+
         foreach (var dir in directories)
         {
-            var dirPath = requestPath.EndsWith("/") ? requestPath + dir.Name + "/" : requestPath + "/" + dir.Name + "/";
-            html.AppendLine($"<a href=\"{dirPath}\">{dir.Name}/</a>");
+            pathBuilder.Clear();
+            pathBuilder.Append(requestPath);
+            if (!requestPath.EndsWith("/"))
+                pathBuilder.Append('/');
+            pathBuilder.Append(dir.Name);
+            pathBuilder.Append('/');
+
+            html.Append("<a href=\"")
+                .Append(pathBuilder.ToString())
+                .Append("\">")
+                .Append(dir.Name)
+                .AppendLine("/</a>");
         }
-        
-        // Then list files
+
         var files = directory.GetFiles()
             .OrderBy(f => f.Name, StringComparer.OrdinalIgnoreCase);
-            
+
         foreach (var file in files)
         {
-            var filePath = requestPath.EndsWith("/") ? requestPath + file.Name : requestPath + "/" + file.Name;
+            pathBuilder.Clear();
+            pathBuilder.Append(requestPath);
+            if (!requestPath.EndsWith("/"))
+                pathBuilder.Append('/');
+            pathBuilder.Append(file.Name);
+
             var formattedSize = FormatFileSize(file.Length);
             var lastModified = file.LastWriteTime.ToString("yyyy-MM-dd HH:mm");
-            html.AppendLine($"<a href=\"{filePath}\">{file.Name}</a>    {lastModified}    {formattedSize}");
+
+            html.Append("<a href=\"")
+                .Append(pathBuilder.ToString())
+                .Append("\">")
+                .Append(file.Name)
+                .Append("</a>    ")
+                .Append(lastModified)
+                .Append("    ")
+                .AppendLine(formattedSize);
         }
     }
     catch (UnauthorizedAccessException)
     {
         html.AppendLine("Access denied to this directory.");
     }
-    
+
     html.AppendLine("</pre>");
     html.AppendLine("<hr>");
     html.AppendLine("</body>");
     html.AppendLine("</html>");
-    
+
     return html.ToString();
 }
 
@@ -450,24 +493,29 @@ bool CanNavigateToParent(DirectoryInfo directory, HashSet<DirectoryInfo> allowed
 {
     var parent = directory.Parent;
     if (parent == null) return false;
-    
-    // Check if parent is within allowed directories
-    return allowedResourceDirectories.Any(allowedDirectory => 
-        parent.FullName.Equals(allowedDirectory.FullName) || 
+
+    return allowedResourceDirectories.Any(allowedDirectory =>
+        parent.FullName.Equals(allowedDirectory.FullName) ||
         parent.FullName.StartsWith(allowedDirectory.FullName + Path.DirectorySeparatorChar));
 }
 
 string FormatFileSize(long bytes)
 {
-    string[] suffixes = ["B", "KB", "MB", "GB", "TB"];
+    if (bytes == 0) return "0B";
+
     int counter = 0;
     decimal number = bytes;
-    while (Math.Round(number / 1024) >= 1)
+
+    while (counter < Constants.FileSizeSuffixes.Length - 1 && Math.Round(number / 1024) >= 1)
     {
         number /= 1024;
         counter++;
     }
-    return $"{number:n1}{suffixes[counter]}";
+
+    var sb = new StringBuilder(8);
+    sb.Append(number.ToString("0.#"));
+    sb.Append(Constants.FileSizeSuffixes[counter]);
+    return sb.ToString();
 }
 
 HashSet<DirectoryInfo> ScanAllowedResourceDirectories(IEnumerable<string> permittedResourceDirectories)
@@ -488,9 +536,27 @@ HashSet<DirectoryInfo> ScanAllowedResourceDirectories(IEnumerable<string> permit
 
 internal static class Constants
 {
-    public const string HttpMethodGet = "GET";
+    // HTTP Methods (RFC 9110 Section 9)
+    public const string MethodGet = "GET";
 
-    public const string HttpResponseOk = "200 OK";
-    public const string HttpResponseNotFound = "404 Not Found";
-    public const string HttpResponseForbidden = "403 Forbidden";
+    // HTTP Status Codes (RFC 9110 Section 15)
+    public const string StatusOk = "200 OK";
+    public const string StatusNotFound = "404 Not Found";
+    public const string StatusForbidden = "403 Forbidden";
+
+    // HTTP Protocol (RFC 9112 Section 2.1)
+    public const string HttpVersion11 = "HTTP/1.1";
+
+    // HTTP Line Termination (RFC 9112 Section 2.2)
+    public const string CRLF = "\r\n";
+
+    // Connection Header Values (RFC 9110 Section 7.6.1)
+    public const string ConnectionKeepAlive = "keep-alive";
+    public const string ConnectionClose = "close";
+
+    public static readonly Encoding Utf8Encoding = Encoding.UTF8;
+    public static readonly string[] CRLFSeparator = ["\r\n"];
+    public static readonly char[] SpaceSeparator = [' '];
+    public static readonly char[] TrimChars = ['\0', ' ', '\r', '\n'];
+    public static readonly string[] FileSizeSuffixes = ["B", "KB", "MB", "GB", "TB"];
 }
