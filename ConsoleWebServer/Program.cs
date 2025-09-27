@@ -76,6 +76,9 @@ async Task ListenerLoop(TcpListener listener, HashSet<DirectoryInfo> allowedReso
 
 async Task HandleNewClient(Socket socket, HashSet<DirectoryInfo> allowedResourceDirectories, Dictionary<EndPoint, Socket> clients)
 {
+    const int keepAliveTimeoutSeconds = 60;
+    using var connectionCts = new CancellationTokenSource();
+    
     try
     {
         Console.WriteLine($"New client connected: {socket.RemoteEndPoint}");
@@ -85,25 +88,37 @@ async Task HandleNewClient(Socket socket, HashSet<DirectoryInfo> allowedResource
         {
             try
             {
-                var message = await ReadData(socket, Encoding.UTF8);
+                // Set timeout for keep-alive connections (60 seconds)
+                connectionCts.CancelAfter(TimeSpan.FromSeconds(keepAliveTimeoutSeconds));
                 
+                var message = await ReadData(socket, Encoding.UTF8, connectionCts.Token);
+
                 // If we get an empty message, client likely disconnected
                 if (string.IsNullOrEmpty(message))
                 {
                     break;
                 }
-                
+
+                // Reset the timeout for the next request after successful read
+                connectionCts.CancelAfter(Timeout.Infinite);
+
                 // Log only the request line, not the full content
                 var requestLine = message.Split("\r\n", StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
                 Console.WriteLine($"Client {socket.RemoteEndPoint} -> Server: {requestLine}");
-                
-                var keepAlive = await TryHandleHttpRequest(message, socket, allowedResourceDirectories);
-                
+
+                var keepAlive = await TryHandleHttpRequest(message, socket, allowedResourceDirectories, connectionCts.Token);
+
                 // If keep-alive is false, close the connection
                 if (!keepAlive)
                 {
                     break;
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                // Timeout occurred - close the connection
+                Console.WriteLine($"Keep-alive timeout ({keepAliveTimeoutSeconds}s) reached for {socket.RemoteEndPoint}");
+                break;
             }
             catch (SocketException)
             {
@@ -137,15 +152,15 @@ async Task HandleNewClient(Socket socket, HashSet<DirectoryInfo> allowedResource
     }
 }
 
-async Task<string> ReadData(Socket socket, Encoding encoding)
+async Task<string> ReadData(Socket socket, Encoding encoding, CancellationToken cancellationToken = default)
 {
     var buffer = new byte[4096];
-    var bytesReceived = await socket.ReceiveAsync(buffer);
+    var bytesReceived = await socket.ReceiveAsync(buffer, cancellationToken);
     var message = encoding.GetString(buffer, 0, bytesReceived);
     return message.TrimEnd('\0', ' ', '\r', '\n');
 }
 
-async Task<bool> TryHandleHttpRequest(string message, Socket socket, HashSet<DirectoryInfo> allowedResourceDirectories)
+async Task<bool> TryHandleHttpRequest(string message, Socket socket, HashSet<DirectoryInfo> allowedResourceDirectories, CancellationToken cancellationToken = default)
 {
     if (message.Length == 0)
     {
@@ -185,7 +200,7 @@ async Task<bool> TryHandleHttpRequest(string message, Socket socket, HashSet<Dir
     switch (method.ToUpperInvariant())
     {
         case Constants.HttpMethodGet:
-            await HandleHttpGetRequest(resourceLocator, httpVersion, splitHttpRequestLine, socket, allowedResourceDirectories, keepAlive);
+            await HandleHttpGetRequest(resourceLocator, httpVersion, splitHttpRequestLine, socket, allowedResourceDirectories, keepAlive, cancellationToken);
             return keepAlive;
         default:
             if (!keepAlive)
@@ -194,7 +209,7 @@ async Task<bool> TryHandleHttpRequest(string message, Socket socket, HashSet<Dir
     }
 }
 
-async Task HandleHttpGetRequest(string resourceLocator, string httpVersion, string[] splitHttpRequestLine, Socket socket, HashSet<DirectoryInfo> allowedResourceDirectories, bool keepAlive)
+async Task HandleHttpGetRequest(string resourceLocator, string httpVersion, string[] splitHttpRequestLine, Socket socket, HashSet<DirectoryInfo> allowedResourceDirectories, bool keepAlive, CancellationToken cancellationToken = default)
 {
     try
     {
@@ -237,12 +252,12 @@ async Task HandleHttpGetRequest(string resourceLocator, string httpVersion, stri
         {
             // Generate directory listing
             var directoryListing = GenerateDirectoryListing(matchingDirectory, pathOnly, allowedResourceDirectories);
-            await SendResponse(socket, Constants.HttpResponseOk, "text/html", directoryListing, keepAlive);
+            await SendResponse(socket, Constants.HttpResponseOk, "text/html", directoryListing, keepAlive, cancellationToken);
         }
         else if (matchingFile != null)
         {
             // Serve the file - use streaming for better memory efficiency
-            await SendFileResponse(socket, matchingFile, keepAlive);
+            await SendFileResponse(socket, matchingFile, keepAlive, cancellationToken);
         }
         else
         {
@@ -256,7 +271,7 @@ async Task HandleHttpGetRequest(string resourceLocator, string httpVersion, stri
                     var indexFile = new FileInfo(indexPath);
                     if (indexFile.Exists)
                     {
-                        await SendFileResponse(socket, indexFile, keepAlive);
+                        await SendFileResponse(socket, indexFile, keepAlive, cancellationToken);
                         indexFound = true;
                         break;
                     }
@@ -265,13 +280,13 @@ async Task HandleHttpGetRequest(string resourceLocator, string httpVersion, stri
             
             if (!indexFound)
             {
-                await SendResponse(socket, Constants.HttpResponseNotFound, "text/plain", "404 Not Found", keepAlive);
+                await SendResponse(socket, Constants.HttpResponseNotFound, "text/plain", "404 Not Found", keepAlive, cancellationToken);
             }
         }
     }
     catch (SecurityException)
     {
-        await SendResponse(socket, Constants.HttpResponseForbidden, "text/plain", "403 Forbidden", keepAlive);
+        await SendResponse(socket, Constants.HttpResponseForbidden, "text/plain", "403 Forbidden", keepAlive, cancellationToken);
     }
     finally
     {
@@ -292,13 +307,20 @@ bool CheckKeepAlive(string[] headers)
     return false; // Default to close connection if no keep-alive header
 }
 
-async Task SendResponse(Socket socket, string statusCode, string contentType, string content, bool keepAlive)
+async Task SendResponse(Socket socket, string statusCode, string contentType, string content, bool keepAlive, CancellationToken cancellationToken = default)
 {
     var contentBytes = Encoding.UTF8.GetBytes(content);
     var headers = $"HTTP/1.1 {statusCode}\r\n" +
                  $"Content-Type: {contentType}\r\n" +
                  $"Content-Length: {contentBytes.Length}\r\n" +
-                 $"Connection: {(keepAlive ? "keep-alive" : "close")}\r\n\r\n";
+                 $"Connection: {(keepAlive ? "keep-alive" : "close")}\r\n";
+    
+    if (keepAlive)
+    {
+        headers += $"Keep-Alive: timeout=60, max=100\r\n";
+    }
+    
+    headers += "\r\n";
     
     var headerBytes = Encoding.UTF8.GetBytes(headers);
     
@@ -306,19 +328,26 @@ async Task SendResponse(Socket socket, string statusCode, string contentType, st
     Console.WriteLine($"Server -> Client {socket.RemoteEndPoint}: {headers.TrimEnd()}");
     
     // Send headers
-    await socket.SendAsync(headerBytes);
+    await socket.SendAsync(headerBytes, cancellationToken);
     
     // Send content
-    await socket.SendAsync(contentBytes);
+    await socket.SendAsync(contentBytes, cancellationToken);
 }
 
-async Task SendFileResponse(Socket socket, FileInfo file, bool keepAlive)
+async Task SendFileResponse(Socket socket, FileInfo file, bool keepAlive, CancellationToken cancellationToken = default)
 {
     var contentType = GetContentType(file.Extension);
     var headers = $"HTTP/1.1 {Constants.HttpResponseOk}\r\n" +
                  $"Content-Type: {contentType}\r\n" +
                  $"Content-Length: {file.Length}\r\n" +
-                 $"Connection: {(keepAlive ? "keep-alive" : "close")}\r\n\r\n";
+                 $"Connection: {(keepAlive ? "keep-alive" : "close")}\r\n";
+    
+    if (keepAlive)
+    {
+        headers += $"Keep-Alive: timeout=60, max=100\r\n";
+    }
+    
+    headers += "\r\n";
     
     var headerBytes = Encoding.UTF8.GetBytes(headers);
     
@@ -326,15 +355,15 @@ async Task SendFileResponse(Socket socket, FileInfo file, bool keepAlive)
     Console.WriteLine($"Server -> Client {socket.RemoteEndPoint}: {headers.TrimEnd()}");
     
     // Send headers
-    await socket.SendAsync(headerBytes);
+    await socket.SendAsync(headerBytes, cancellationToken);
     
     // Stream file content in chunks to avoid loading entire file into memory
     using var fileStream = file.OpenRead();
     var buffer = new byte[8192];
     int bytesRead;
-    while ((bytesRead = await fileStream.ReadAsync(buffer)) > 0)
+    while ((bytesRead = await fileStream.ReadAsync(buffer, cancellationToken)) > 0)
     {
-        await socket.SendAsync(buffer.AsMemory(0, bytesRead));
+        await socket.SendAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
     }
 }
 
