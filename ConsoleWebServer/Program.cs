@@ -324,7 +324,7 @@ bool CanNavigateToParent(DirectoryInfo directory, HashSet<DirectoryInfo> allowed
 
 string FormatFileSize(long bytes)
 {
-    string[] suffixes = { "B", "KB", "MB", "GB", "TB" };
+    string[] suffixes = ["B", "KB", "MB", "GB", "TB"];
     int counter = 0;
     decimal number = bytes;
     while (Math.Round(number / 1024) >= 1)
